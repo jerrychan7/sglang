@@ -254,7 +254,8 @@ class ResponseFormat(BaseModel):
     json_schema: Optional[JsonSchemaResponseFormat] = None
 
 
-class ChatCompletionRequest(BaseModel):
+import vllm.entrypoints.openai.protocol as vllm_protocol
+class ChatCompletionRequest(vllm_protocol.ChatCompletionRequest):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
@@ -286,6 +287,7 @@ class ChatCompletionRequest(BaseModel):
 class ChatMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    tool_calls: List[vllm_protocol.ToolCall] = Field(default_factory=list)
 
 
 class ChatCompletionResponseChoice(BaseModel):

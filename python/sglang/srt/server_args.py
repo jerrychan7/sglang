@@ -24,6 +24,8 @@ from typing import List, Optional
 
 from sglang.srt.utils import is_flashinfer_available, is_ipv6, is_port_available
 
+from vllm.entrypoints.openai.tool_parsers import ToolParserManager
+
 logger = logging.getLogger(__name__)
 
 
@@ -128,6 +130,10 @@ class ServerArgs:
     triton_attention_reduce_in_fp32: bool = False
     num_continuous_decode_steps: int = 1
 
+    enable_auto_tool_choice: bool = False
+    tool_call_parser: Optional[str] = None
+    tool_parser_plugin: str = ""
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -202,8 +208,53 @@ class ServerArgs:
             logger.info("When using sliding window in gemma-2, turn on flashinfer.")
             self.attention_backend = "flashinfer"
 
+        # Enable auto tool needs a tool call parser to be valid
+        if self.enable_auto_tool_choice and not self.tool_call_parser:
+            raise TypeError("Error: --enable-auto-tool-choice requires "
+                            "--tool-call-parser")
+
+        if self.tool_parser_plugin and len(self.tool_parser_plugin) > 3:
+            ToolParserManager.import_tool_parser(self.tool_parser_plugin)
+
+        valide_tool_parses = ToolParserManager.tool_parsers.keys()
+        if self.enable_auto_tool_choice \
+            and self.tool_call_parser not in valide_tool_parses:
+            raise KeyError(f"invalid tool call parser: {self.tool_call_parser} "
+                        f"(chose from {{ {','.join(valide_tool_parses)} }})")
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
+
+        parser.add_argument(
+            "--enable-auto-tool-choice",
+            action="store_true",
+            default=False,
+            help=
+            "Enable auto tool choice for supported models. Use --tool-call-parser"
+            " to specify which parser to use")
+
+        valid_tool_parsers = ToolParserManager.tool_parsers.keys()
+        parser.add_argument(
+            "--tool-call-parser",
+            type=str,
+            metavar="{" + ",".join(valid_tool_parsers) + "} or name registered in "
+            "--tool-parser-plugin",
+            default=None,
+            help=
+            "Select the tool call parser depending on the model that you're using."
+            " This is used to parse the model-generated tool call into OpenAI API "
+            "format. Required for --enable-auto-tool-choice.")
+
+        parser.add_argument(
+            "--tool-parser-plugin",
+            type=str,
+            default="",
+            help=
+            "Special the tool parser plugin write to parse the model-generated tool"
+            " into OpenAI API format, the name register in this plugin can be used "
+            "in --tool-call-parser.")
+
+
         parser.add_argument(
             "--model-path",
             type=str,

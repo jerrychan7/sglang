@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Union
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.sampling_params import SamplingParams
 
+import vllm.entrypoints.openai.protocol as vllm_protocol
 
 @dataclass
 class GenerateReqInput:
@@ -55,6 +56,14 @@ class GenerateReqInput:
     modalities: Optional[List[str]] = None
     # LoRA related
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+
+    tools: Optional[List[vllm_protocol.ChatCompletionRequest]] = None
+    tool_choice: Optional[Union[
+        vllm_protocol.Literal["none"],
+        vllm_protocol.Literal["auto"],
+        vllm_protocol.ChatCompletionNamedToolChoiceParam
+    ]] = "none"
+    parallel_tool_calls: Optional[bool] = None
 
     def normalize_batch_and_arguments(self):
         if (self.text is None and self.input_ids is None) or (
@@ -171,6 +180,9 @@ class GenerateReqInput:
             stream=self.stream,
             modalities=self.modalities[i] if self.modalities else None,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
+            tools=self.tools if self.tools is not None else None,
+            tool_choice=self.tool_choice if self.tool_choice is not None else None,
+            parallel_tool_calls=self.parallel_tool_calls if self.parallel_tool_calls is not None else None,
         )
 
 

@@ -70,6 +70,8 @@ from sglang.srt.openai_api.protocol import (
     LogProbs,
     TopLogprob,
     UsageInfo,
+    ChatCompletionMessageParam,
+    ChatCompletionMessageGenericParam,
 )
 from sglang.utils import get_exception_traceback
 
@@ -115,6 +117,7 @@ def create_streaming_error_response(
     return json_str
 
 
+# qs：这里是加载和处理模型的 tokenizer_config.json 中的 chat_template 字段
 def load_chat_template_for_openai_api(tokenizer_manager, chat_template_arg):
     global chat_template_name
 
@@ -308,6 +311,7 @@ async def process_batch(tokenizer_manager, batch_id: str, batch_request: BatchRe
                     ret,
                     to_file=True,
                     cache_report=tokenizer_manager.server_args.enable_cache_report,
+                    tokenizer_manager=tokenizer_manager,
                 )
             else:
                 responses = v1_generate_response(
@@ -962,12 +966,22 @@ def v1_chat_generate_request(
         return_text_in_logprobs=True,
         rid=request_ids,
         modalities=modalities_list,
+        # qs：这里是否要考虑第一次请求和第二次请求时 tools 相关的内容不一样？
+        tools=all_requests[0].tools,
+        tool_choice=all_requests[0].tool_choice,
+        parallel_tool_calls=all_requests[0].parallel_tool_calls,
     )
 
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
 
-
-def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
+from ..managers.tokenizer_manager import TokenizerManager
+def v1_chat_generate_response(
+    request: List[ChatCompletionRequest] | ChatCompletionRequest,
+    ret,
+    to_file=False,
+    cache_report=False,
+    tokenizer_manager: TokenizerManager | None = None,
+):
     choices = []
 
     for idx, ret_item in enumerate(ret):
@@ -1010,13 +1024,82 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
 
         finish_reason = ret_item["meta_info"]["finish_reason"]
 
+        role = "assistant"
+        # In the OpenAI API the finish_reason is "tools_called"
+        # if the tool choice is auto and the model produced a tool
+        # call. The same is not true for named function calls
+        auto_tools_called = False
+
+        # if auto tools are not enabled, and a named tool choice using
+        #   outlines is not being used
+        if (not tokenizer_manager.enable_auto_tools
+                or not tokenizer_manager.tool_parser) and not isinstance(
+                    request.tool_choice,
+                    vllm_protocol.ChatCompletionNamedToolChoiceParam):
+            message = ChatMessage(role=role, content=ret_item["text"])
+
+        # if the request uses tools and specified a tool choice
+        elif request.tool_choice and type(
+                request.tool_choice) is vllm_protocol.ChatCompletionNamedToolChoiceParam:
+
+            message = ChatMessage(
+                role=role,
+                content="",
+                tool_calls=[
+                    vllm_protocol.ToolCall(function=vllm_protocol.FunctionCall(
+                        name=request.tool_choice.function.name,
+                        arguments=ret_item["text"]))
+                ])
+
+        # if the request doesn't use tool choice
+        # OR specifies to not use a tool
+        elif not request.tool_choice or request.tool_choice == "none":
+
+            message = ChatMessage(role=role, content=ret_item["text"])
+
+        # handle when there are tools and tool choice is auto
+        elif request.tools and (
+                request.tool_choice == "auto"
+                or request.tool_choice is None) and tokenizer_manager.enable_auto_tools \
+                and tokenizer_manager.tool_parser:
+
+            try:
+                tool_parser = tokenizer_manager.tool_parser(tokenizer_manager.tokenizer)
+            except RuntimeError as e:
+                logger.exception("Error in tool parser creation.")
+                return create_error_response(str(e))
+
+            tool_call_info = tool_parser.extract_tool_calls(
+                ret_item["text"], request=request)
+            # In the OpenAI API the finish_reason is "tools_called"
+            # if the tool choice is auto and the model produced a tool
+            # call. The same is not true for named function calls
+            auto_tools_called = tool_call_info.tools_called
+            if tool_call_info.tools_called:
+                message = ChatMessage(role=role,
+                                        content=tool_call_info.content,
+                                        tool_calls=tool_call_info.tool_calls)
+
+            else:
+                # FOR NOW make it a chat message; we will have to detect
+                # the type to make it later.
+                message = ChatMessage(role=role, content=ret_item["text"])
+
+        # undetermined case that is still important to handle
+        else:
+            logger.error(
+                "Error in chat_completion_full_generator - cannot determine"
+                " if tools should be extracted. Returning a standard chat "
+                "completion.")
+            message = ChatMessage(role=role, content=ret_item["text"])
+
         if to_file:
             # to make the choice data json serializable
             choice_data = {
                 "index": 0,
-                "message": {"role": "assistant", "content": ret_item["text"]},
+                "message": message.dict(),
                 "logprobs": choice_logprobs,
-                "finish_reason": (finish_reason["type"] if finish_reason else ""),
+                "finish_reason": "tool_calls" if auto_tools_called else (finish_reason["type"] if finish_reason else ""),
                 "matched_stop": (
                     finish_reason["matched"]
                     if finish_reason and "matched" in finish_reason
@@ -1026,9 +1109,9 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
         else:
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
-                message=ChatMessage(role="assistant", content=ret_item["text"]),
+                message=message,
                 logprobs=choice_logprobs,
-                finish_reason=(finish_reason["type"] if finish_reason else ""),
+                finish_reason="tool_calls" if auto_tools_called else (finish_reason["type"] if finish_reason else ""),
                 matched_stop=(
                     finish_reason["matched"]
                     if finish_reason and "matched" in finish_reason
@@ -1085,10 +1168,63 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
         return response
 
 
-async def v1_chat_completions(tokenizer_manager, raw_request: Request):
+from datetime import datetime
+import re
+import vllm.entrypoints.openai.protocol as vllm_protocol
+from ..managers.tokenizer_manager import TokenizerManager
+def build_new_messages_with_tools(
+    tokenizer_manager: TokenizerManager,
+    messages: List[ChatCompletionMessageParam],
+    tools: List[vllm_protocol.ChatCompletionToolsParam]
+):
+    # 根据tools生成新的system prompt, 并替换原来的system prompt
+    # 返回新的messages
+    today = datetime.now().strftime('%Y-%m-%d')
+    system_prompt = f"You are Qwen, created by Alibaba Cloud. You are a helpful assistant.\n如果需要用到时间，请注意今天为{today}."
+    system_prompt_index = -1
+    for index, message in enumerate(messages):
+        if message.role == 'system':
+            system_prompt = message.content
+            system_prompt_index = index
+            break
+    logger.debug(f"==== ori system_prompt ====\n{system_prompt}")
+    new_system_prompt = tokenizer_manager.tokenizer.apply_chat_template(
+        [{'role': 'system', 'content': system_prompt}],
+        add_generation_prompt=False,
+        tokenize=False,
+        tools=[t.dict() for t in tools],
+        language="zh",
+    )
+    new_system_prompt = re.sub(r"^<\|im_start\|>system\n", "", new_system_prompt)
+    new_system_prompt = re.sub(r"<\|im_end\|>\n$", "", new_system_prompt)
+    # 插入原来的message列表中
+    if system_prompt_index >= 0:
+        messages[system_prompt_index].content = new_system_prompt
+    else:
+        messages.insert(0, ChatCompletionMessageGenericParam(role="system", content=new_system_prompt))
+    return messages
+
+# def preprocess_chat(request: ChatCompletionRequest, ret_item: dict, tokenizer_manager: TokenizerManager):
+#     tool_parser = tokenizer_manager.tool_parser
+#     if tool_parser is not None:
+#         if not isinstance(request, ChatCompletionRequest):
+#             msg = "Tool usage is only supported for Chat Completions API"
+#             raise NotImplementedError(msg)
+
+#         request = tool_parser(tokenizer_manager.tokenizer).adjust_request(request=request)
+#     return request
+
+
+async def v1_chat_completions(tokenizer_manager: TokenizerManager, raw_request: Request):
     request_json = await raw_request.json()
     all_requests = [ChatCompletionRequest(**request_json)]
+    print(all_requests)
+    if all_requests[0].tools:
+        all_requests[0].messages = build_new_messages_with_tools(tokenizer_manager, all_requests[0].messages, all_requests[0].tools)
+    print(all_requests)
     adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
+    # print(adapted_request)
+    # print(request)
 
     if adapted_request.stream:
 
@@ -1251,8 +1387,13 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
     if not isinstance(ret, list):
         ret = [ret]
 
+    print(ret)
+
+
+
     response = v1_chat_generate_response(
-        request, ret, cache_report=tokenizer_manager.server_args.enable_cache_report
+        request, ret, cache_report=tokenizer_manager.server_args.enable_cache_report,
+        tokenizer_manager=tokenizer_manager,
     )
 
     return response

@@ -22,7 +22,7 @@ import logging
 import os
 import signal
 import sys
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Callable
 
 import fastapi
 import uvloop
@@ -55,6 +55,8 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_zmq_socket, kill_child_process
+
+import vllm.entrypoints.openai.tool_parsers as vllm_tool_parsers
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -139,6 +141,25 @@ class TokenizerManager:
         self.model_update_lock = asyncio.Lock()
         self.model_update_result = None
 
+        # Tools
+        self.enable_auto_tools = server_args.enable_auto_tool_choice
+        if self.enable_auto_tools:
+            logger.info(
+                "\"auto\" tool choice has been enabled please note that while"
+                " the parallel_tool_calls client option is preset for "
+                "compatibility reasons, it will be ignored.")
+
+        self.tool_parser: Optional[Callable[[vllm_tool_parsers.AnyTokenizer], vllm_tool_parsers.ToolParser]] = None
+        tool_parser = server_args.tool_call_parser
+        if self.enable_auto_tools:
+            try:
+                self.tool_parser = vllm_tool_parsers.ToolParserManager.get_tool_parser(
+                    tool_parser)
+            except Exception as e:
+                raise TypeError("Error: --enable-auto-tool-choice requires "
+                                f"tool_parser:'{tool_parser}' which has not "
+                                "been registered") from e
+
         # Others
         self.gracefully_exit = False
 
@@ -215,7 +236,7 @@ class TokenizerManager:
                 logprob_start_len,
                 top_logprobs_num,
                 obj.stream,
-                obj.lora_path
+                obj.lora_path,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
