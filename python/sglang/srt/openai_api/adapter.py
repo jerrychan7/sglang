@@ -22,7 +22,7 @@ import os
 import time
 import uuid
 from http import HTTPStatus
-from typing import Dict, List
+from typing import Dict, List, Callable, Optional
 
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -79,6 +79,7 @@ from ..managers.tokenizer_manager import TokenizerManager
 from datetime import datetime
 import re
 import vllm.entrypoints.openai.protocol as vllm_protocol
+import vllm.entrypoints.openai.tool_parsers as vllm_tool_parsers
 
 logger = logging.getLogger(__name__)
 
@@ -1235,6 +1236,60 @@ async def v1_chat_completions(tokenizer_manager: TokenizerManager, raw_request: 
             n_prev_tokens = {}
             prompt_tokens = {}
             completion_tokens = {}
+
+            created_time = int(time.time())
+            # Send response for each token for each request.n (index)
+            num_choices = 1 if request.n is None else request.n
+            previous_num_tokens = [0] * num_choices
+            finish_reason_sent = [False] * num_choices
+
+            if isinstance(request.tool_choice, vllm_protocol.ChatCompletionNamedToolChoiceParam):
+                tool_choice_function_name = request.tool_choice.function.name
+            else:
+                tool_choice_function_name = None
+
+            should_stream_with_auto_tool_parsing: Callable[[ChatCompletionRequest], bool] = lambda request: (
+                request.tools and tokenizer_manager.tool_parser and tokenizer_manager.enable_auto_tools
+                    and request.tool_choice in ['auto', None]
+            )
+
+            # Determine whether tools are in use with "auto" tool choice
+            tool_choice_auto = (
+                not tool_choice_function_name
+                and should_stream_with_auto_tool_parsing(request)
+            )
+
+            all_previous_token_ids: Optional[List[List[int]]]
+            if tool_choice_auto:
+                # These are only required in "auto" tool choice case
+                previous_texts = [""] * num_choices
+                all_previous_token_ids = [[]] * num_choices
+            else:
+                previous_texts, all_previous_token_ids = None, None
+
+            # Prepare the tool parser if it's needed
+            try:
+                if tool_choice_auto and tokenizer_manager.tool_parser:
+                    tool_parsers: List[Optional[vllm_tool_parsers.ToolParser]] = [
+                        tokenizer_manager.tool_parser(tokenizer_manager.tokenizer)
+                    ] * num_choices
+                else:
+                    tool_parsers = [None] * num_choices
+            except RuntimeError as e:
+                logger.exception("Error in tool parser creation.")
+                data = create_streaming_error_response(str(e))
+                yield f"data: {data}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            stream_options = request.stream_options
+            if stream_options:
+                include_usage = stream_options.include_usage
+                include_continuous_usage = include_usage and \
+                                        stream_options.continuous_usage_stats
+            else:
+                include_usage, include_continuous_usage = False, False
+
             try:
                 async for content in tokenizer_manager.generate_request(
                     adapted_request, raw_request
@@ -1244,6 +1299,12 @@ async def v1_chat_completions(tokenizer_manager: TokenizerManager, raw_request: 
                     is_first = is_firsts.get(index, True)
                     stream_buffer = stream_buffers.get(index, "")
                     n_prev_token = n_prev_tokens.get(index, 0)
+                    def update_status():
+                        is_firsts[index] = is_first
+                        stream_buffers[index] = stream_buffer
+                        n_prev_tokens[index] = n_prev_token
+
+                    tool_parser: vllm_tool_parsers.ToolParser = tool_parsers[index]
 
                     prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                     completion_tokens[index] = content["meta_info"]["completion_tokens"]
@@ -1299,7 +1360,7 @@ async def v1_chat_completions(tokenizer_manager: TokenizerManager, raw_request: 
                         is_first = False
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
-                            delta=DeltaMessage(role="assistant"),
+                            delta=DeltaMessage(role="assistant", content=''),
                             finish_reason=(
                                 finish_reason["type"] if finish_reason else ""
                             ),
@@ -1312,37 +1373,182 @@ async def v1_chat_completions(tokenizer_manager: TokenizerManager, raw_request: 
                         )
                         chunk = ChatCompletionStreamResponse(
                             id=content["meta_info"]["id"],
+                            object="chat.completion.chunk",
+                            created=created_time,
                             choices=[choice_data],
                             model=request.model,
                         )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        if include_continuous_usage:
+                            chunk.usage = UsageInfo(
+                                prompt_tokens=prompt_tokens[index],
+                                completion_tokens=0,
+                                total_tokens=prompt_tokens[index],
+                            )
+                        yield f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n"
 
                     text = content["text"]
                     delta = text[len(stream_buffer) :]
                     stream_buffer = stream_buffer + delta
-                    choice_data = ChatCompletionResponseStreamChoice(
-                        index=index,
-                        delta=DeltaMessage(content=delta),
-                        finish_reason=(finish_reason["type"] if finish_reason else ""),
-                        matched_stop=(
-                            finish_reason["matched"]
-                            if finish_reason and "matched" in finish_reason
-                            else None
-                        ),
-                        logprobs=choice_logprobs,
-                    )
+                    output_token_ids = tokenizer_manager.tokenizer.encode(delta)
+
+                    if not delta and not output_token_ids and not previous_num_tokens[index]:
+                        # Chunked prefill case, don't return empty chunks
+                        update_status()
+                        continue
+
+                    delta_message: Optional[DeltaMessage]
+
+                    # handle streaming deltas for tools with named tool_choice
+                    if tool_choice_function_name:
+                        delta_message = DeltaMessage(tool_calls=[
+                            vllm_protocol.DeltaToolCall(
+                                function=vllm_protocol.DeltaFunctionCall(
+                                    name=tool_choice_function_name,
+                                    arguments=delta,
+                                ),
+                                index=index,
+                            )
+                        ])
+
+                    # handle streaming deltas for tools with "auto" tool choice
+                    elif tool_choice_auto:
+                        assert previous_texts is not None
+                        assert all_previous_token_ids is not None
+                        assert tool_parser is not None
+                        #TODO optimize manipulation of these lists
+                        previous_text = previous_texts[index]
+                        previous_token_ids = all_previous_token_ids[index]
+                        # current_text = previous_text + delta
+                        current_text = text
+                        current_token_ids = previous_token_ids + list(output_token_ids)
+
+                        delta_message = tool_parser.extract_tool_calls_streaming(
+                            previous_text=previous_text,
+                            current_text=current_text,
+                            delta_text=delta,
+                            previous_token_ids=previous_token_ids,
+                            current_token_ids=current_token_ids,
+                            delta_token_ids=output_token_ids,
+                            request=request,
+                        )
+
+                        # update the previous values for the next iteration
+                        previous_texts[index] = current_text
+                        all_previous_token_ids[index] = current_token_ids
+
+                    # handle streaming just a content delta
+                    else:
+                        delta_message = DeltaMessage(content=delta)
+
+                    # set the previous values for the next iteration
+                    previous_num_tokens[index] += len(output_token_ids)
+
+                    # if the message delta is None (e.g. because it was a
+                    # "control token" for tool calls or the parser otherwise
+                    # wasn't ready to send a token, then
+                    #   get the next token without streaming a chunk
+                    if delta_message is None:
+                        update_status()
+                        continue
+
+                    if finish_reason is None:
+                        # Send token-by-token response for each request.n
+                        choice_data = ChatCompletionResponseStreamChoice(
+                            index=index,
+                            delta=delta_message,
+                            logprobs=choice_logprobs,
+                            finish_reason=None,
+                        )
+
+                    # if the model is finished generating
+                    else:
+                        # check to make sure we haven't "forgotten" to stream
+                        #   any tokens that were generated but previously
+                        #   matched by partial json parsing
+                        # only happens if we are NOT using guided decoding
+                        auto_tools_called = False
+                        if tool_parser:
+                            auto_tools_called = len(
+                                tool_parser.prev_tool_call_arr) > 0
+                            index = len(tool_parser.prev_tool_call_arr
+                                        ) - 1 if auto_tools_called else 0
+                        else:
+                            index = 0
+
+                        should_check_for_unstreamed_tool_arg_tokens: Callable[[Optional[DeltaMessage]], bool] = lambda delta_message: bool(
+                            # if there is a delta message that includes tool calls which
+                            # include a function that has arguments
+                            finish_reason is not None
+                            and tokenizer_manager.enable_auto_tools and tokenizer_manager.tool_parser
+                            and delta_message
+                            and delta_message.tool_calls
+                            and delta_message.tool_calls[0]
+                            and delta_message.tool_calls[0].function
+                            and delta_message.tool_calls[0].function.arguments is not None
+                        )
+
+                        if should_check_for_unstreamed_tool_arg_tokens(delta_message) and tool_parser:
+                            # get the expected call based on partial JSON
+                            # parsing which "autocompletes" the JSON
+                            expected_call = json.dumps(
+                                tool_parser.prev_tool_call_arr[index].get(
+                                    "arguments", {}
+                                )
+                            )
+
+                            # get what we've streamed so far for arguments
+                            # for the current tool
+                            actual_call = tool_parser.streamed_args_for_tool[index]
+
+                            # check to see if there's anything left to stream
+                            remaining_call = expected_call.replace(actual_call, "", 1)
+
+                            # set that as a delta message
+                            delta_message = DeltaMessage(tool_calls=[
+                                vllm_protocol.DeltaToolCall(
+                                    index=index,
+                                    function=vllm_protocol.DeltaFunctionCall(
+                                        arguments=remaining_call
+                                    ).model_dump(exclude_none=True)
+                                )
+                            ])
+
+                        # Send the finish response for each request.n only once
+                        choice_data = ChatCompletionResponseStreamChoice(
+                            index=index,
+                            delta=delta_message,
+                            logprobs=choice_logprobs,
+                            finish_reason=(finish_reason["type"] if finish_reason else "") if not auto_tools_called else "tool_calls",
+                            matched_stop=(
+                                finish_reason["matched"]
+                                if finish_reason and "matched" in finish_reason
+                                else None
+                            ),
+                            # stop_reason=output.stop_reason
+                        )
+
+                        finish_reason_sent[index] = True
+
                     chunk = ChatCompletionStreamResponse(
                         id=content["meta_info"]["id"],
+                        object="chat.completion.chunk",
+                        created=created_time,
                         choices=[choice_data],
                         model=request.model,
                     )
 
-                    is_firsts[index] = is_first
-                    stream_buffers[index] = stream_buffer
-                    n_prev_tokens[index] = n_prev_token
+                    # handle usage stats if requested & if continuous
+                    if include_continuous_usage:
+                        chunk.usage = UsageInfo(
+                            prompt_tokens=prompt_tokens[index],
+                            completion_tokens=previous_num_tokens[index],
+                            total_tokens=prompt_tokens[index] + previous_num_tokens[index],
+                        )
 
-                    yield f"data: {chunk.model_dump_json()}\n\n"
-                if request.stream_options and request.stream_options.include_usage:
+                    update_status()
+
+                    yield f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n"
+                if include_usage:
                     total_prompt_tokens = sum(
                         tokens
                         for i, tokens in prompt_tokens.items()

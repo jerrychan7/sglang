@@ -82,6 +82,7 @@ class UsageInfo(BaseModel):
 
 class StreamOptions(BaseModel):
     include_usage: Optional[bool] = False
+    continuous_usage_stats: Optional[bool] = False
 
 
 class JsonSchemaResponseFormat(BaseModel):
@@ -307,25 +308,26 @@ class ChatCompletionResponse(BaseModel):
     usage: UsageInfo
 
 
-class DeltaMessage(BaseModel):
+class DeltaMessage(vllm_protocol.DeltaMessage):
     role: Optional[str] = None
     content: Optional[str] = None
+    # tool_calls: List[vllm_protocol.DeltaToolCall] = Field(default_factory=list)
 
 
-class ChatCompletionResponseStreamChoice(BaseModel):
+class ChatCompletionResponseStreamChoice(vllm_protocol.ChatCompletionResponseStreamChoice):
     index: int
-    delta: DeltaMessage
+    # delta: DeltaMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[str] = None
     matched_stop: Union[None, int, str] = None
 
 
-class ChatCompletionStreamResponse(BaseModel):
+class ChatCompletionStreamResponse(vllm_protocol.ChatCompletionStreamResponse):
     id: str
-    object: str = "chat.completion.chunk"
-    created: int = Field(default_factory=lambda: int(time.time()))
-    model: str
-    choices: List[ChatCompletionResponseStreamChoice]
+    # object: str = "chat.completion.chunk"
+    # created: int = Field(default_factory=lambda: int(time.time()))
+    # model: str
+    # choices: List[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
 
 
