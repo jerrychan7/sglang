@@ -57,6 +57,9 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_zmq_socket, kill_child_process
 
 import vllm.entrypoints.openai.tool_parsers as vllm_tool_parsers
+from datetime import datetime
+import json
+import pytz
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -277,11 +280,74 @@ class TokenizerManager:
             else:  # isinstance(obj, (EmbeddingReqInput,))
                 out = state.out_list[-1]
 
+            # state.out_list = []
+            if self.server_args.log_requests and state.finished:
+                # Log requests
+                # logger.info(f"in={obj}, out={out}")
+                input_text = 'Unknown'
+                sampling_params = {}
+                # rid = []
+                rid = ""
+                stream = False
+                if obj is not None:
+                    if obj.input_ids is not None:
+                        input_text = self.tokenizer.decode(obj.input_ids, skip_special_tokens=True)
+                    if obj.sampling_params is not None:
+                        sampling_params = obj.sampling_params
+                    if obj.rid is not None:
+                        rid = obj.rid
+                    if obj.stream is not None:
+                        stream = obj.stream
+
+                output_text = ""
+                meta_info = {}
+                prompt_tokens = 0
+                completion_tokens = 0
+                completion_tokens_wo_jump_forward = 0
+                if out is not None:
+                    output_text = out.get('text',"")
+                    output_meta_info = out.get('meta_info', {})
+                    if output_meta_info is not None:
+                        meta_info = output_meta_info or {}
+                        prompt_tokens = meta_info.get('prompt_tokens', 0)
+                        completion_tokens = meta_info.get('completion_tokens', 0)
+                        completion_tokens_wo_jump_forward = meta_info.get('completion_tokens_wo_jump_forward', 0)
+
+                # 日志包装
+                log_entry = {
+                    'Timestamp': datetime.now(pytz.timezone('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M:%S'),
+                    'Input_text': input_text,
+                    'sampling_param': sampling_params,
+                    'rid': rid,
+                    'stream': stream,
+                    'Output_text': output_text,
+                    'Output_metainfo': meta_info,
+                    'prompt_tokens': prompt_tokens,
+                    'completion_tokens': completion_tokens,
+                    'completion_tokens_wo_jump_forward': completion_tokens_wo_jump_forward
+                }
+                # 抽取租户信息
+                try:
+                    raw_req_params = await request.json()
+                    if raw_req_params is not None:
+                        tenant_id = raw_req_params.get('tenant_id')
+                        tenant_name = raw_req_params.get('tenant_name')
+                        if tenant_id is not None:
+                            log_entry['tenant_id'] = tenant_id
+                        if tenant_name is not None:
+                            log_entry['tenant_name'] = tenant_name
+                except Exception as e:
+                    logger.error(f"Error parsing request JSON: {e}")
+                try:
+                    log_json = json.dumps(log_entry, ensure_ascii=False)
+                    logger.info(log_json)
+                except (TypeError, ValueError) as e:
+                    logger.error(f"Failed to serialize log entry to JSON: {e}")
+                    logger.info(f"{log_entry}")
+
             state.out_list = []
+
             if state.finished:
-                if self.server_args.log_requests:
-                    # Log requests
-                    logger.info(f"in={obj}, out={out}")
                 del self.rid_to_state[obj.rid]
                 yield out
                 break

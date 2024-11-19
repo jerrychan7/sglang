@@ -75,6 +75,11 @@ from sglang.srt.openai_api.protocol import (
 )
 from sglang.utils import get_exception_traceback
 
+from ..managers.tokenizer_manager import TokenizerManager
+from datetime import datetime
+import re
+import vllm.entrypoints.openai.protocol as vllm_protocol
+
 logger = logging.getLogger(__name__)
 
 chat_template_name = None
@@ -843,7 +848,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
 
 def v1_chat_generate_request(
     all_requests: List[ChatCompletionRequest],
-    tokenizer_manager,
+    tokenizer_manager: TokenizerManager,
     request_ids: List[str] = None,
 ):
     input_ids = []
@@ -974,7 +979,6 @@ def v1_chat_generate_request(
 
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
 
-from ..managers.tokenizer_manager import TokenizerManager
 def v1_chat_generate_response(
     request: List[ChatCompletionRequest] | ChatCompletionRequest,
     ret,
@@ -1168,10 +1172,6 @@ def v1_chat_generate_response(
         return response
 
 
-from datetime import datetime
-import re
-import vllm.entrypoints.openai.protocol as vllm_protocol
-from ..managers.tokenizer_manager import TokenizerManager
 def build_new_messages_with_tools(
     tokenizer_manager: TokenizerManager,
     messages: List[ChatCompletionMessageParam],
@@ -1218,13 +1218,9 @@ def build_new_messages_with_tools(
 async def v1_chat_completions(tokenizer_manager: TokenizerManager, raw_request: Request):
     request_json = await raw_request.json()
     all_requests = [ChatCompletionRequest(**request_json)]
-    print(all_requests)
     if all_requests[0].tools:
         all_requests[0].messages = build_new_messages_with_tools(tokenizer_manager, all_requests[0].messages, all_requests[0].tools)
-    print(all_requests)
     adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
-    # print(adapted_request)
-    # print(request)
 
     if adapted_request.stream:
 
@@ -1386,10 +1382,6 @@ async def v1_chat_completions(tokenizer_manager: TokenizerManager, raw_request: 
         return create_error_response(str(e))
     if not isinstance(ret, list):
         ret = [ret]
-
-    print(ret)
-
-
 
     response = v1_chat_generate_response(
         request, ret, cache_report=tokenizer_manager.server_args.enable_cache_report,
