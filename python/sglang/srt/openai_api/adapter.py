@@ -1073,6 +1073,11 @@ def v1_chat_generate_response(
                 logger.exception("Error in tool parser creation.")
                 return create_error_response(str(e))
 
+            # qs：去掉两个花括号，添加兼容性（qwen2.5 2024/9/18 更新的版本中，chat_template有两个花括号的bug）
+            if ret_item["text"].startswith('<tool_call>\n{{'):
+                ret_item["text"] = ret_item["text"]\
+                    .replace('<tool_call>\n{{', '<tool_call>\n{')\
+                    .replace('}}\n</tool_call>', '}\n</tool_call>')
             tool_call_info = tool_parser.extract_tool_calls(
                 ret_item["text"], request=request)
             # In the OpenAI API the finish_reason is "tools_called"
